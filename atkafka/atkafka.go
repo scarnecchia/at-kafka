@@ -18,6 +18,7 @@ import (
 	"github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/atproto/atdata"
 	"github.com/bluesky-social/indigo/atproto/identity"
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/events/schedulers/parallel"
 	"github.com/bluesky-social/indigo/repo"
@@ -242,7 +243,7 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) FetchEventMetadata(ctx context.Context, did string) (*EventMetadata, *identity.Identity, error) {
+func (s *Server) FetchEventMetadata(ctx context.Context, did syntax.DID) (*EventMetadata, *identity.Identity, error) {
 	var ident *identity.Identity
 	var didDocument identity.DIDDocument
 	var pdsHost string
@@ -267,31 +268,34 @@ func (s *Server) FetchEventMetadata(ctx context.Context, did string) (*EventMeta
 			handle = ident.Handle.String()
 		})
 
-		wg.Go(func() {
-			logger := s.logger.With("component", "auditLog")
-			auditLog, err := s.plcClient.GetDIDAuditLog(ctx, did)
-			if err != nil {
-				logger.Error("error fetching did audit log", "did", did, "err", err)
-				return
-			}
+		// We can only fetch the audit log from did:plc
+		if did.Method() == "plc" {
+			wg.Go(func() {
+				logger := s.logger.With("component", "auditLog")
+				auditLog, err := s.plcClient.GetDIDAuditLog(ctx, did)
+				if err != nil {
+					logger.Error("error fetching did audit log", "did", did, "err", err)
+					return
+				}
 
-			didCreatedAt = auditLog.CreatedAt
+				didCreatedAt = auditLog.CreatedAt
 
-			createdAt, err := time.Parse(time.RFC3339Nano, auditLog.CreatedAt)
-			if err != nil {
-				logger.Error("error parsing timestamp in audit log", "did", did, "timestamp", auditLog.CreatedAt, "err", err)
-				return
-			}
+				createdAt, err := time.Parse(time.RFC3339Nano, auditLog.CreatedAt)
+				if err != nil {
+					logger.Error("error parsing timestamp in audit log", "did", did, "timestamp", auditLog.CreatedAt, "err", err)
+					return
+				}
 
-			accountAge = int64(time.Since(createdAt).Seconds())
-		})
+				accountAge = int64(time.Since(createdAt).Seconds())
+			})
+		}
 	}
 
 	if s.apiClient != nil {
 		wg.Go(func() {
 			logger := s.logger.With("component", "profile")
 			var err error
-			profile, err = s.apiClient.GetProfile(ctx, did)
+			profile, err = s.apiClient.GetProfile(ctx, did.String())
 			if err != nil {
 				logger.Error("error getting actor profile", "did", did, "err", err)
 				return
@@ -335,7 +339,13 @@ func (s *Server) handleEvent(ctx context.Context, evt *events.XRPCStreamEvent) e
 			return nil
 		}
 
-		eventMetadata, ident, err := s.FetchEventMetadata(dispatchCtx, evt.RepoCommit.Repo)
+		did, err := syntax.ParseDID(evt.RepoCommit.Repo)
+		if err != nil {
+			s.logger.Error("received invalid DID from repo car", "did", evt.RepoCommit.Repo, "err", err)
+			return nil
+		}
+
+		eventMetadata, ident, err := s.FetchEventMetadata(dispatchCtx, did)
 		if err != nil {
 			logger.Error("error fetching event metadata", "err", err)
 		} else if ident != nil {
@@ -552,7 +562,13 @@ func (s *Server) handleEvent(ctx context.Context, evt *events.XRPCStreamEvent) e
 		if did != "" {
 			// key events by DID
 			evtKey = did
-			eventMetadata, ident, err := s.FetchEventMetadata(dispatchCtx, did)
+			parsedDid, err := syntax.ParseDID(did)
+			if err != nil {
+				s.logger.Error("received invalid DID from repo event", "did", did, "err", err)
+				return nil
+			}
+
+			eventMetadata, ident, err := s.FetchEventMetadata(dispatchCtx, parsedDid)
 			if err != nil {
 				logger.Error("error fetching event metadata", "err", err)
 			} else if ident != nil {
